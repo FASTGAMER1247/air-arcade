@@ -260,23 +260,29 @@ class HandTracker:
         self.left_pos:  Optional[Tuple[float,float]] = None
         self.right_pos: Optional[Tuple[float,float]] = None
         self.frame_rgb: Optional[np.ndarray] = None
-        self._start_time = time.time()
+        self._start_time = time.perf_counter()
+        self._last_timestamp_ms = -1
         self.running = True
         
         self.thread = threading.Thread(target=self._capture_loop, daemon=True)
         self.thread.start()
 
     def _capture_loop(self):
-        while self.running:
-            ret, frame = self.cap.read()
-            if not ret:
-                continue
-            frame = cv2.flip(frame, 1)
-            rgb   = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            timestamp_ms = int((time.time() - self._start_time) * 1000)
-            results = self.landmarker.detect_for_video(mp_image, timestamp_ms)
+        try:
+            while self.running:
+                ret, frame = self.cap.read()
+                if not ret:
+                    time.sleep(0.01)
+                    continue
+                frame = cv2.flip(frame, 1)
+                rgb   = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                timestamp_ms = int((time.perf_counter() - self._start_time) * 1000)
+                if timestamp_ms <= self._last_timestamp_ms:
+                    timestamp_ms = self._last_timestamp_ms + 1
+                self._last_timestamp_ms = timestamp_ms
+                results = self.landmarker.detect_for_video(mp_image, timestamp_ms)
             
             left = None
             right = None
@@ -320,6 +326,10 @@ class HandTracker:
             else:
                 self.right_pos = None
             self.frame_rgb = rgb
+        finally:
+            if getattr(self, "landmarker", None) is not None:
+                self.landmarker.close()
+                self.landmarker = None
 
 
     def update(self):
@@ -336,8 +346,13 @@ class HandTracker:
     def release(self):
         self.running = False
         if self.thread.is_alive():
-            self.thread.join(timeout=1.0)
-        self.cap.release()
+            self.thread.join(timeout=3.0)
+        if getattr(self, "cap", None) is not None:
+            self.cap.release()
+            self.cap = None
+        if not self.thread.is_alive() and getattr(self, "landmarker", None) is not None:
+            self.landmarker.close()
+            self.landmarker = None
 
 
 # ─────────────────────────── FONT HELPERS ─────────────────────
@@ -484,119 +499,122 @@ def main():
         pygame.draw.line(grid_surf, (255,255,255,8), (0,gy), (GAME_W, gy))
 
     running = True
-    while running:
-        dt = clock.tick(240) / 1000.0
-        tracker.update()
-        cam_surf = tracker.get_webcam_surface()
+    try:
+        while running:
+            dt = clock.tick(240) / 1000.0
+            tracker.update()
+            cam_surf = tracker.get_webcam_surface()
 
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
-            if event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_ESCAPE:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
                     running = False
-                if event.key == pygame.K_q:
-                    if state in (STATE_START, STATE_WIN):
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        running = False
+                    if event.key == pygame.K_q:
+                        if state in (STATE_START, STATE_WIN):
+                            score = [0, 0]
+                            ball.reset()
+                            p1.x, p1.y = GAME_W//4,   GAME_H//2
+                            p2.x, p2.y = 3*GAME_W//4, GAME_H//2
+                            particles.clear()
+                            state = STATE_PLAY
+                    if event.key == pygame.K_r:
                         score = [0, 0]
                         ball.reset()
                         p1.x, p1.y = GAME_W//4,   GAME_H//2
                         p2.x, p2.y = 3*GAME_W//4, GAME_H//2
                         particles.clear()
-                        state = STATE_PLAY
-                if event.key == pygame.K_r:
-                    score = [0, 0]
-                    ball.reset()
-                    p1.x, p1.y = GAME_W//4,   GAME_H//2
-                    p2.x, p2.y = 3*GAME_W//4, GAME_H//2
-                    particles.clear()
-                    if state != STATE_START:
-                        state = STATE_PLAY
+                        if state != STATE_START:
+                            state = STATE_PLAY
 
-        # ── START ──
-        if state == STATE_START:
-            draw_start_screen(screen, font_big, font_med, font_small, cam_surf)
+            # ── START ──
+            if state == STATE_START:
+                draw_start_screen(screen, font_big, font_med, font_small, cam_surf)
 
-        # ── PLAY ──
-        elif state == STATE_PLAY:
-            # move paddles from hand positions
-            if tracker.left_pos:
-                p1.move_to(*tracker.left_pos, dt)
-            if tracker.right_pos:
-                p2.move_to(*tracker.right_pos, dt)
+            # ── PLAY ──
+            elif state == STATE_PLAY:
+                # move paddles from hand positions
+                if tracker.left_pos:
+                    p1.move_to(*tracker.left_pos, dt)
+                if tracker.right_pos:
+                    p2.move_to(*tracker.right_pos, dt)
 
-            ball.update(dt, particles)
-            p1.check_ball_collision(ball, particles)
-            p2.check_ball_collision(ball, particles)
+                ball.update(dt, particles)
+                p1.check_ball_collision(ball, particles)
+                p2.check_ball_collision(ball, particles)
 
-            # update particles
-            for p in particles:
-                p.update(dt)
-            particles = [p for p in particles if p.alive]
+                # update particles
+                for p in particles:
+                    p.update(dt)
+                particles = [p for p in particles if p.alive]
 
-            # scoring — ball passes goal line (left or right edge)
-            scored = 0
-            if ball.x - BALL_R < 0:
-                scored = 2          # P2 scores (ball went past P1's side)
-            elif ball.x + BALL_R > GAME_W:
-                scored = 1          # P1 scores
+                # scoring — ball passes goal line (left or right edge)
+                scored = 0
+                if ball.x - BALL_R < 0:
+                    scored = 2          # P2 scores (ball went past P1's side)
+                elif ball.x + BALL_R > GAME_W:
+                    scored = 1          # P1 scores
 
-            if scored:
-                score[scored-1] += 1
-                last_scorer = scored
-                spawn_particles(particles, ball.x, ball.y, C_BALL, 40, 250)
-                if score[scored-1] >= WIN_SCORE:
-                    winner = scored
-                    state  = STATE_WIN
-                else:
-                    ball.reset(direction=1 if scored==1 else -1)
-                    goal_timer = GOAL_DELAY
-                    state = STATE_GOAL
+                if scored:
+                    score[scored-1] += 1
+                    last_scorer = scored
+                    spawn_particles(particles, ball.x, ball.y, C_BALL, 40, 250)
+                    if score[scored-1] >= WIN_SCORE:
+                        winner = scored
+                        state  = STATE_WIN
+                    else:
+                        ball.reset(direction=1 if scored==1 else -1)
+                        goal_timer = GOAL_DELAY
+                        state = STATE_GOAL
 
-            # draw
-            draw_arena(screen, score[0], score[1], font_big, font_med, font_small, cam_surf)
-            screen.blit(grid_surf, (0, 0))
+                # draw
+                draw_arena(screen, score[0], score[1], font_big, font_med, font_small, cam_surf)
+                screen.blit(grid_surf, (0, 0))
 
-            # draw particles under paddles/ball
-            for p in particles:
-                p.draw(screen)
-            p1.draw(screen)
-            p2.draw(screen)
-            ball.draw(screen)
+                # draw particles under paddles/ball
+                for p in particles:
+                    p.draw(screen)
+                p1.draw(screen)
+                p2.draw(screen)
+                ball.draw(screen)
 
-            # hand tracking indicators
-            if tracker.left_pos is None:
-                render_neon_text(screen, font_small,
-                                 "No left hand detected!", C_P1, GAME_W//4, GAME_H - 60)
-            if tracker.right_pos is None:
-                render_neon_text(screen, font_small,
-                                 "No right hand detected!", C_P2, 3*GAME_W//4, GAME_H - 60)
+                # hand tracking indicators
+                if tracker.left_pos is None:
+                    render_neon_text(screen, font_small,
+                                     "No left hand detected!", C_P1, GAME_W//4, GAME_H - 60)
+                if tracker.right_pos is None:
+                    render_neon_text(screen, font_small,
+                                     "No right hand detected!", C_P2, 3*GAME_W//4, GAME_H - 60)
 
-        # ── GOAL ──
-        elif state == STATE_GOAL:
-            draw_arena(screen, score[0], score[1], font_big, font_med, font_small, cam_surf)
-            screen.blit(grid_surf, (0, 0))
-            for p in particles:
-                p.update(dt)
-                p.draw(screen)
-            particles = [p for p in particles if p.alive]
-            draw_goal_screen(screen, font_big, font_med, last_scorer, particles, dt)
-            goal_timer -= dt
-            if goal_timer <= 0:
-                state = STATE_PLAY
+            # ── GOAL ──
+            elif state == STATE_GOAL:
+                draw_arena(screen, score[0], score[1], font_big, font_med, font_small, cam_surf)
+                screen.blit(grid_surf, (0, 0))
+                for p in particles:
+                    p.update(dt)
+                    p.draw(screen)
+                particles = [p for p in particles if p.alive]
+                draw_goal_screen(screen, font_big, font_med, last_scorer, particles, dt)
+                goal_timer -= dt
+                if goal_timer <= 0:
+                    state = STATE_PLAY
 
-        # ── WIN ──
-        elif state == STATE_WIN:
-            draw_win_screen(screen, font_big, font_med, font_small, winner)
+            # ── WIN ──
+            elif state == STATE_WIN:
+                draw_win_screen(screen, font_big, font_med, font_small, winner)
 
-        # FPS Counter
-        fps = clock.get_fps()
-        fps_text = font_small.render(f"FPS: {int(fps)}", True, (0, 255, 0))
-        screen.blit(fps_text, (10, 10))
+            # FPS Counter
+            fps = clock.get_fps()
+            fps_text = font_small.render(f"FPS: {int(fps)}", True, (0, 255, 0))
+            screen.blit(fps_text, (10, 10))
 
-        pygame.display.flip()
-
-    tracker.release()
-    pygame.quit()
+            pygame.display.flip()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        tracker.release()
+        pygame.quit()
 
 
 if __name__ == '__main__':

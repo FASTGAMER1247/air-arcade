@@ -16,6 +16,7 @@ import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 import numpy as np
+import os
 import time
 import math
 from dataclasses import dataclass, field
@@ -99,12 +100,9 @@ class LivePuzzle:
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  FRAME_WIDTH)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
 
-        # MediaPipe Tasks API
-        base_options = mp_python.BaseOptions(model_asset_path='hand_landmarker.task')
-        
-        self.latest_hands: List[Hand] = []
-        def result_callback(result, output_image, timestamp_ms):
-            self.latest_hands = self.process_hands(result)
+        # MediaPipe Tasks API (VIDEO mode avoids async callback deadlocks and reference cycles)
+        model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'hand_landmarker.task')
+        base_options = mp_python.BaseOptions(model_asset_path=model_path)
 
         options = vision.HandLandmarkerOptions(
             base_options=base_options,
@@ -112,8 +110,7 @@ class LivePuzzle:
             min_hand_detection_confidence=HAND_CONF,
             min_hand_presence_confidence=TRACK_CONF,
             min_tracking_confidence=TRACK_CONF,
-            running_mode=vision.RunningMode.LIVE_STREAM,
-            result_callback=result_callback
+            running_mode=vision.RunningMode.VIDEO,
         )
         self.landmarker = vision.HandLandmarker.create_from_options(options)
         self.perf_start_time = time.perf_counter()
@@ -222,13 +219,15 @@ class LivePuzzle:
     # ── Hand processing ────────────────────────────────────────────────────────
     def process_hands(self, results) -> List[Hand]:
         hands = []
-        if not results.hand_landmarks:
+        if not results.hand_landmarks or not results.handedness:
             return hands
 
         for hand_landmarks, handedness in zip(
             results.hand_landmarks,
             results.handedness
         ):
+            if not handedness:
+                continue
             lms = np.array([[l.x * FRAME_WIDTH, l.y * FRAME_HEIGHT, l.z]
                             for l in hand_landmarks])
 
@@ -439,121 +438,143 @@ class LivePuzzle:
         self.dragging_tile = None
         self.palm_hold_start_time = 0.0
 
+    def close(self):
+        """Release camera, MediaPipe landmarker, and OpenCV windows."""
+        if getattr(self, "landmarker", None) is not None:
+            self.landmarker.close()
+            self.landmarker = None
+        if getattr(self, "cap", None) is not None:
+            self.cap.release()
+            self.cap = None
+        cv2.destroyAllWindows()
+
     # ── Main loop ─────────────────────────────────────────────────────────────
     def run(self):
-        cv2.namedWindow("Live Puzzle", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("Live Puzzle", FRAME_WIDTH, FRAME_HEIGHT)
+        try:
+            if not self.cap or not self.cap.isOpened():
+                print("Error: Could not open webcam for Live Puzzle.")
+                return
 
-        t_prev = time.time()
+            cv2.namedWindow("Live Puzzle", cv2.WINDOW_NORMAL)
+            cv2.resizeWindow("Live Puzzle", FRAME_WIDTH, FRAME_HEIGHT)
 
-        while True:
-            ret, frame = self.cap.read()
-            if not ret:
-                break
+            t_prev = time.time()
 
-            frame = cv2.flip(frame, 1)
-            rgb   = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            timestamp_ms = int((time.perf_counter() - self.perf_start_time) * 1000)
-            if timestamp_ms <= self.last_timestamp_ms:
-                timestamp_ms = self.last_timestamp_ms + 1
-            self.last_timestamp_ms = timestamp_ms
+            while True:
+                ret, frame = self.cap.read()
+                if not ret:
+                    break
 
-            self.landmarker.detect_async(mp_image, timestamp_ms)
-            hands = self.latest_hands
+                frame = cv2.flip(frame, 1)
+                rgb   = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                timestamp_ms = int((time.perf_counter() - self.perf_start_time) * 1000)
+                if timestamp_ms <= self.last_timestamp_ms:
+                    timestamp_ms = self.last_timestamp_ms + 1
+                self.last_timestamp_ms = timestamp_ms
 
-            now = time.time()
+                results = self.landmarker.detect_for_video(mp_image, timestamp_ms)
+                hands = self.process_hands(results)
 
-            # FPS
-            self.fps_deque.append(now - t_prev)
-            t_prev = now
-            self.frame_count += 1
-            if self.frame_count % 30 == 0 and self.fps_deque:
-                avg = sum(self.fps_deque) / len(self.fps_deque)
-                self.fps_display = 1.0 / avg if avg > 0 else 0
+                now = time.time()
 
-            # ── Phase logic ─────────────────────────────────────────────────
-            if self.phase == GamePhase.WAITING:
-                h, w = frame.shape[:2]
-                if len(hands) == 2:
-                    p1 = hands[0].index_finger_tip
-                    p2 = hands[1].index_finger_tip
-                    cx = (p1[0] + p2[0]) / 2
-                    cy = (p1[1] + p2[1]) / 2
-                    size = max(abs(p1[0]-p2[0]), abs(p1[1]-p2[1]))
-                    size = min(size, min(w, h))
-                    x0 = max(0, min(int(cx - size/2), w - int(size)))
-                    y0 = max(0, min(int(cy - size/2), h - int(size)))
-                    self.capture_rect = (x0, y0, int(size))
-                else:
-                    size = min(h, w)
-                    x0 = (w - size) // 2
-                    y0 = (h - size) // 2
-                    self.capture_rect = (x0, y0, size)
+                # FPS
+                self.fps_deque.append(now - t_prev)
+                t_prev = now
+                self.frame_count += 1
+                if self.frame_count % 30 == 0 and self.fps_deque:
+                    avg = sum(self.fps_deque) / len(self.fps_deque)
+                    self.fps_display = 1.0 / avg if avg > 0 else 0
 
-                frame_gesture = self.check_frame_gesture(hands)
-                dual_pinch    = (len(hands) == 2 and
-                                 hands[0].is_pinching and hands[1].is_pinching)
-                if frame_gesture and dual_pinch and now > self.capture_cooldown:
+                # ── Phase logic ─────────────────────────────────────────────────
+                if self.phase == GamePhase.WAITING:
+                    h, w = frame.shape[:2]
+                    if len(hands) == 2:
+                        p1 = hands[0].index_finger_tip
+                        p2 = hands[1].index_finger_tip
+                        cx = (p1[0] + p2[0]) / 2
+                        cy = (p1[1] + p2[1]) / 2
+                        size = max(abs(p1[0]-p2[0]), abs(p1[1]-p2[1]))
+                        size = min(size, min(w, h))
+                        x0 = max(0, min(int(cx - size/2), w - int(size)))
+                        y0 = max(0, min(int(cy - size/2), h - int(size)))
+                        self.capture_rect = (x0, y0, int(size))
+                    else:
+                        size = min(h, w)
+                        x0 = (w - size) // 2
+                        y0 = (h - size) // 2
+                        self.capture_rect = (x0, y0, size)
+
+                    frame_gesture = self.check_frame_gesture(hands)
+                    dual_pinch    = (len(hands) == 2 and
+                                     hands[0].is_pinching and hands[1].is_pinching)
+                    if frame_gesture and dual_pinch and now > self.capture_cooldown:
+                        self.create_tiles(frame, self.capture_rect)
+                        self.phase      = GamePhase.PUZZLE
+                        self.start_time = time.time()
+                        self.capture_cooldown = now + 1.5
+
+                elif self.phase == GamePhase.PUZZLE:
+                    self.elapsed = time.time() - self.start_time
+                    self.update_drag(hands)
+                    if self.dragging_tile is None and self.check_solved():
+                        self.phase = GamePhase.SOLVED
+
+                elif self.phase == GamePhase.SOLVED:
+                    if len(hands) == 2 and all(h.is_open_palm for h in hands):
+                        if self.palm_hold_start_time == 0.0:
+                            self.palm_hold_start_time = time.time()
+                        elif time.time() - self.palm_hold_start_time >= 3.0:
+                            self.reset()
+                    else:
+                        self.palm_hold_start_time = 0.0
+
+                # ── Render ──────────────────────────────────────────────────────
+                if self.phase == GamePhase.WAITING and self.capture_rect and len(hands) == 2:
+                    x0, y0, size = self.capture_rect
+                    cv2.rectangle(frame, (x0, y0), (x0+size, y0+size), (0, 255, 255), 2)
+                    cell = size // GRID_SIZE
+                    for i in range(1, GRID_SIZE):
+                        cv2.line(frame, (x0 + i*cell, y0), (x0 + i*cell, y0 + size), (0, 255, 255), 1)
+                        cv2.line(frame, (x0, y0 + i*cell), (x0 + size, y0 + i*cell), (0, 255, 255), 1)
+
+                if self.phase in (GamePhase.PUZZLE, GamePhase.SOLVED):
+                    self.draw_ghost_grid(frame)
+                    self.draw_tiles(frame)
+
+                for h in hands:
+                    self.draw_hand(frame, h)
+
+                self.draw_ui(frame, hands)
+
+                cv2.imshow("Live Puzzle", frame)
+
+                # ── Keyboard & window-close input ───────────────────────────────
+                key = cv2.waitKey(1) & 0xFF
+                if key in (ord('q'), ord('Q'), 27):
+                    break
+                elif key in (ord('c'), ord('C')) and self.phase == GamePhase.WAITING:
+                    if self.capture_rect is None:
+                        h, w = frame.shape[:2]
+                        size = min(h, w)
+                        x0 = (w - size) // 2
+                        y0 = (h - size) // 2
+                        self.capture_rect = (x0, y0, size)
                     self.create_tiles(frame, self.capture_rect)
                     self.phase      = GamePhase.PUZZLE
                     self.start_time = time.time()
-                    self.capture_cooldown = now + 1.5
+                elif key in (ord('r'), ord('R')):
+                    self.reset()
 
-            elif self.phase == GamePhase.PUZZLE:
-                self.elapsed = time.time() - self.start_time
-                self.update_drag(hands)
-                if self.dragging_tile is None and self.check_solved():
-                    self.phase = GamePhase.SOLVED
-
-            elif self.phase == GamePhase.SOLVED:
-                if len(hands) == 2 and all(h.is_open_palm for h in hands):
-                    if self.palm_hold_start_time == 0.0:
-                        self.palm_hold_start_time = time.time()
-                    elif time.time() - self.palm_hold_start_time >= 3.0:
-                        self.reset()
-                else:
-                    self.palm_hold_start_time = 0.0
-
-            # ── Render ──────────────────────────────────────────────────────
-            if self.phase == GamePhase.WAITING and self.capture_rect and len(hands) == 2:
-                x0, y0, size = self.capture_rect
-                cv2.rectangle(frame, (x0, y0), (x0+size, y0+size), (0, 255, 255), 2)
-                cell = size // GRID_SIZE
-                for i in range(1, GRID_SIZE):
-                    cv2.line(frame, (x0 + i*cell, y0), (x0 + i*cell, y0 + size), (0, 255, 255), 1)
-                    cv2.line(frame, (x0, y0 + i*cell), (x0 + size, y0 + i*cell), (0, 255, 255), 1)
-
-            if self.phase in (GamePhase.PUZZLE, GamePhase.SOLVED):
-                self.draw_ghost_grid(frame)
-                self.draw_tiles(frame)
-
-            for h in hands:
-                self.draw_hand(frame, h)
-
-            self.draw_ui(frame, hands)
-
-            cv2.imshow("Live Puzzle", frame)
-
-            # ── Keyboard input ──────────────────────────────────────────────
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                break
-            elif key == ord('c') and self.phase == GamePhase.WAITING:
-                if self.capture_rect is None:
-                    h, w = frame.shape[:2]
-                    size = min(h, w)
-                    x0 = (w - size) // 2
-                    y0 = (h - size) // 2
-                    self.capture_rect = (x0, y0, size)
-                self.create_tiles(frame, self.capture_rect)
-                self.phase      = GamePhase.PUZZLE
-                self.start_time = time.time()
-            elif key == ord('r'):
-                self.reset()
-
-        self.cap.release()
-        cv2.destroyAllWindows()
+                try:
+                    if cv2.getWindowProperty("Live Puzzle", cv2.WND_PROP_VISIBLE) < 1:
+                        break
+                except cv2.error:
+                    break
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.close()
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
